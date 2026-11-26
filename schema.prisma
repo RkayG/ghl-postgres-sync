@@ -1,0 +1,156 @@
+// prisma/schema.prisma
+// Prisma is pinned to v6 (pnpm i prisma@6 @prisma/client@6) so this generator syntax works as written.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // Neon pooled connection string
+  directUrl = env("DIRECT_URL")   // Neon direct connection string (used by migrations)
+}
+
+enum ConsentStatus {
+  UNKNOWN
+  GRANTED
+  WITHDRAWN
+}
+
+enum ConsentChannel {
+  EMAIL
+  SMS
+  PHONE
+}
+
+enum OpportunityStatus {
+  OPEN
+  WON
+  LOST
+  ABANDONED
+}
+
+// One row per HighLevel location (sub-account) that installed the app.
+// Tokens are stored encrypted (AES-256-GCM). Never as plain text.
+model Installation {
+  id                   String    @id @default(cuid())
+  locationId           String    @unique
+  companyId            String?
+  userType             String // "Location" or "Company"
+  accessTokenEnc       String
+  refreshTokenEnc      String
+  accessTokenExpiresAt DateTime
+  scopes               String?
+  installedAt          DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+  uninstalledAt        DateTime?
+}
+
+// Every webhook delivery, stored once. webhookId is the idempotency key:
+// HighLevel retries failed deliveries, so a unique violation means "already seen".
+// payload holds PII, so erasure must scrub rows matching contactId.
+model WebhookEvent {
+  id          String    @id @default(cuid())
+  webhookId   String    @unique
+  type        String
+  locationId  String?
+  contactId   String?
+  payload     Json
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+  error       String?
+
+  @@index([type, receivedAt])
+  @@index([contactId])
+}
+
+// id is the HighLevel contact id, so upserts are trivial.
+model Contact {
+  id            String        @id
+  locationId    String
+  firstName     String?
+  lastName      String?
+  email         String?
+  phone         String?
+  source        String?
+  tags          String[]
+  consentStatus ConsentStatus @default(UNKNOWN)
+  leadScore     Int? // computed by us, written back to a GHL custom field
+  ghlCreatedAt  DateTime?
+  ghlUpdatedAt  DateTime? // compare before overwriting: webhooks can arrive out of order
+  syncedAt      DateTime      @updatedAt
+
+  opportunities Opportunity[]
+  consents      ConsentRecord[]
+
+  @@index([locationId, source])
+  @@index([locationId, ghlCreatedAt])
+  @@index([email])
+}
+
+model Opportunity {
+  id             String            @id
+  locationId     String
+  contactId      String
+  pipelineId     String
+  pipelineName   String?
+  stageId        String
+  stageName      String?
+  status         OpportunityStatus @default(OPEN)
+  monetaryValue  Decimal?          @db.Decimal(12, 2)
+  ghlCreatedAt   DateTime?
+  ghlUpdatedAt   DateTime?
+  syncedAt       DateTime          @updatedAt
+
+  contact      Contact       @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  stageChanges StageChange[]
+
+  @@index([locationId, pipelineId, stageId])
+  @@index([contactId])
+}
+
+// Append-only history of stage moves. Powers conversion and time-to-first-move metrics.
+model StageChange {
+  id            String   @id @default(cuid())
+  opportunityId String
+  fromStageId   String?
+  toStageId     String
+  toStageName   String?
+  changedAt     DateTime
+  webhookId     String?
+
+  opportunity Opportunity @relation(fields: [opportunityId], references: [id], onDelete: Cascade)
+
+  @@index([opportunityId, changedAt])
+}
+
+model ConsentRecord {
+  id         String         @id @default(cuid())
+  contactId  String
+  channel    ConsentChannel
+  status     ConsentStatus
+  source     String? // e.g. "web form", "manual", "import"
+  evidence   Json?
+  recordedAt DateTime       @default(now())
+
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@index([contactId, channel, recordedAt])
+}
+
+// Survives the deletion it records. contactId is deliberately NOT a foreign key,
+// and we keep only a hash of the email so the log itself holds no PII.
+model ErasureRequest {
+  id          String    @id @default(cuid())
+  locationId  String
+  contactId   String
+  emailHash   String? // sha256 of lowercased email
+  requestedAt DateTime  @default(now())
+  completedAt DateTime?
+  ghlDeleted  Boolean   @default(false)
+  dbDeleted   Boolean   @default(false)
+  eventsScrubbed Int    @default(0)
+  notes       String?
+
+  @@index([locationId, requestedAt])
+}
